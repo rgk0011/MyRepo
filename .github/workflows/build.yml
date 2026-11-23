@@ -1,0 +1,104 @@
+name: Build images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docker/**"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Hangi imaj derlensin?"
+        type: choice
+        options: [all, ada, blackwell]
+        default: all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 360 # GitHub-hosted runner üst sınırı (6 saat)
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [ada, blackwell]
+    env:
+      IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/comfyui-video
+    steps:
+      # Matrix değerleri job seviyesindeki `if` içinde kullanılamadığı için
+      # manuel tetiklemede seçilmeyen hedef burada atlanır.
+      - name: Check target selection
+        id: sel
+        run: |
+          want="${{ github.event.inputs.target || 'all' }}"
+          if [[ "$want" == "all" || "$want" == "${{ matrix.target }}" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Bu hedef seçilmedi, atlanıyor."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Runner'da sadece ~14 GB disk var; imaj çok büyük olduğu için yer açıyoruz
+      - name: Free disk space
+        if: steps.sel.outputs.run == 'true'
+        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout
+        if: steps.sel.outputs.run == 'true'
+        uses: actions/checkout@v7
+
+      - name: Read target build args
+        if: steps.sel.outputs.run == 'true'
+        id: cfg
+        run: |
+          {
+            echo "args<<__EOF__"
+            grep -vE '^\s*(#|$)' "docker/targets/${{ matrix.target }}.args"
+            echo "__EOF__"
+            echo "date=$(date -u +%Y%m%d)"
+            echo "sha=${GITHUB_SHA::7}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Build args:"; grep -vE '^\s*(#|$)' "docker/targets/${{ matrix.target }}.args"
+
+      - name: Set up Docker Buildx
+        if: steps.sel.outputs.run == 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to Docker Hub
+        if: steps.sel.outputs.run == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        if: steps.sel.outputs.run == 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: docker
+          file: docker/Dockerfile
+          push: true
+          build-args: ${{ steps.cfg.outputs.args }}
+          # Sabit etiket (RunPod template'i bunu kullanır) + geri dönüş için değişmez etiket
+          tags: |
+            ${{ env.IMAGE }}:${{ matrix.target }}
+            ${{ env.IMAGE }}:${{ matrix.target }}-${{ steps.cfg.outputs.date }}-${{ steps.cfg.outputs.sha }}
+          # Önceki imajı cache olarak kullan (ekstra depolama yok)
+          cache-from: type=registry,ref=${{ env.IMAGE }}:${{ matrix.target }}
+          cache-to: type=inline
